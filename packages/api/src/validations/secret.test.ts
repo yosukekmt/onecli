@@ -245,6 +245,26 @@ describe("google_service_account schema validation", () => {
     ).toBe(false);
   });
 
+  it("rejects SA JSON with whitespace-only private_key", () => {
+    const ws = JSON.stringify({
+      ...JSON.parse(validSaJson),
+      private_key: "   ",
+    });
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: ws })).success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON with whitespace-only client_email", () => {
+    const ws = JSON.stringify({
+      ...JSON.parse(validSaJson),
+      client_email: "   ",
+    });
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: ws })).success,
+    ).toBe(false);
+  });
+
   it("skips SA JSON validation for 1Password source", () => {
     expect(
       createSecretSchema.safeParse(

@@ -273,7 +273,6 @@ export const createSecret = async (
 
   if (input.type === "google_service_account") {
     validateGoogleServiceAccountValue(value);
-    hostPattern = "www.googleapis.com";
   }
 
   const secret = await db.secret.create({
@@ -367,7 +366,6 @@ export const updateSecret = async (
 
     if (secret.type === "google_service_account") {
       validateGoogleServiceAccountValue(value);
-      data.hostPattern = "www.googleapis.com";
     }
 
     data.valueSource = "inline";

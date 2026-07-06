@@ -430,9 +430,9 @@ export const parseGoogleServiceAccountJson = (
     if (
       parsed.type === "service_account" &&
       typeof parsed.private_key === "string" &&
-      parsed.private_key.length > 0 &&
+      parsed.private_key.trim().length > 0 &&
       typeof parsed.client_email === "string" &&
-      parsed.client_email.length > 0
+      parsed.client_email.trim().length > 0
     ) {
       return parsed as unknown as GoogleServiceAccountJson;
     }
