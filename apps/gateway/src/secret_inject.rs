@@ -247,12 +247,9 @@ pub(crate) async fn resolve_google_sa_token(
     decrypted_json: &str,
     secret_id: &str,
 ) -> Option<String> {
-    resolve_google_sa_token_with(
-        cache,
-        decrypted_json,
-        secret_id,
-        |pk, ce| Box::pin(apps::refresh_google_sa_secret_token(pk, ce)),
-    )
+    resolve_google_sa_token_with(cache, decrypted_json, secret_id, |pk, ce| {
+        Box::pin(apps::refresh_google_sa_secret_token(pk, ce))
+    })
     .await
 }
 
@@ -701,12 +698,9 @@ mod tests {
         cache.set_raw(&cache_key, "ya29.cached-token", 3000).await;
 
         // The fetcher should NOT be called (cache hit).
-        let result = resolve_google_sa_token_with(
-            &cache,
-            TEST_SA_JSON,
-            secret_id,
-            |_pk, _ce| Box::pin(async { panic!("fetcher should not be called on cache hit") }),
-        )
+        let result = resolve_google_sa_token_with(&cache, TEST_SA_JSON, secret_id, |_pk, _ce| {
+            Box::pin(async { panic!("fetcher should not be called on cache hit") })
+        })
         .await;
         assert_eq!(result.as_deref(), Some("ya29.cached-token"));
     }
@@ -739,13 +733,8 @@ mod tests {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
 
-        let result = resolve_google_sa_token_with(
-            &cache,
-            TEST_SA_JSON,
-            secret_id,
-            err_fetcher(),
-        )
-        .await;
+        let result =
+            resolve_google_sa_token_with(&cache, TEST_SA_JSON, secret_id, err_fetcher()).await;
 
         // Returns None on failure
         assert!(result.is_none());
