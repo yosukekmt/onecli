@@ -237,8 +237,8 @@ const SA_TOKEN_CACHE_MARGIN_SECS: u64 = 600;
 ///
 /// Parses the decrypted SA JSON key, checks the in-memory cache for a valid
 /// token, and exchanges a new JWT→access_token if needed. The cache key
-/// includes a hash of `encrypted_value` so that key rotation immediately
-/// invalidates the cached token.
+/// includes a hash of the decrypted JSON so that key rotation immediately
+/// invalidates the cached token (works for both inline and 1Password sources).
 ///
 /// Returns `Some(access_token)` on success, or `None` (after logging) on
 /// failure so the caller can skip the secret.
@@ -246,15 +246,10 @@ pub(crate) async fn resolve_google_sa_token(
     cache: &dyn CacheStore,
     decrypted_json: &str,
     secret_id: &str,
-    encrypted_value: &str,
 ) -> Option<String> {
-    resolve_google_sa_token_with(
-        cache,
-        decrypted_json,
-        secret_id,
-        encrypted_value,
-        |pk, ce| Box::pin(apps::refresh_google_sa_secret_token(pk, ce)),
-    )
+    resolve_google_sa_token_with(cache, decrypted_json, secret_id, |pk, ce| {
+        Box::pin(apps::refresh_google_sa_secret_token(pk, ce))
+    })
     .await
 }
 
@@ -263,7 +258,6 @@ async fn resolve_google_sa_token_with<F>(
     cache: &dyn CacheStore,
     decrypted_json: &str,
     secret_id: &str,
-    encrypted_value: &str,
     fetch_token: F,
 ) -> Option<String>
 where
@@ -294,9 +288,11 @@ where
         }
     };
 
-    // Cache key includes a short hash of the encrypted value so that key
-    // rotation (which changes encrypted_value) invalidates the cache entry.
-    let value_hash = &sha256_hex(encrypted_value)[..16];
+    // Cache key includes a short hash of the decrypted JSON so that key
+    // rotation invalidates the cache entry. This works for both inline
+    // secrets (where encrypted_value changes) and 1Password-sourced secrets
+    // (where encrypted_value is None but the decrypted content changes).
+    let value_hash = &sha256_hex(decrypted_json)[..16];
     let cache_key = format!("sa_token:{secret_id}:{value_hash}");
 
     if let Some(token) = cache.get_raw(&cache_key).await {
@@ -695,21 +691,16 @@ mod tests {
     async fn resolve_google_sa_token_cache_hit() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "secret_123";
-        let encrypted_value = "encrypted_blob";
 
         // Pre-populate cache
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         cache.set_raw(&cache_key, "ya29.cached-token", 3000).await;
 
         // The fetcher should NOT be called (cache hit).
-        let result = resolve_google_sa_token_with(
-            &cache,
-            TEST_SA_JSON,
-            secret_id,
-            encrypted_value,
-            |_pk, _ce| Box::pin(async { panic!("fetcher should not be called on cache hit") }),
-        )
+        let result = resolve_google_sa_token_with(&cache, TEST_SA_JSON, secret_id, |_pk, _ce| {
+            Box::pin(async { panic!("fetcher should not be called on cache hit") })
+        })
         .await;
         assert_eq!(result.as_deref(), Some("ya29.cached-token"));
     }
@@ -718,13 +709,11 @@ mod tests {
     async fn resolve_google_sa_token_cache_miss_exchanges_and_caches() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
-        let encrypted_value = "enc1";
 
         let result = resolve_google_sa_token_with(
             &cache,
             TEST_SA_JSON,
             secret_id,
-            encrypted_value,
             ok_fetcher("ya29.fresh-token", 3600),
         )
         .await;
@@ -733,7 +722,7 @@ mod tests {
         assert_eq!(result.as_deref(), Some("ya29.fresh-token"));
 
         // Token was cached
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         let cached = cache.get_raw(&cache_key).await;
         assert_eq!(cached.as_deref(), Some("ya29.fresh-token"));
@@ -743,22 +732,15 @@ mod tests {
     async fn resolve_google_sa_token_exchange_failure_not_cached() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
-        let encrypted_value = "enc1";
 
-        let result = resolve_google_sa_token_with(
-            &cache,
-            TEST_SA_JSON,
-            secret_id,
-            encrypted_value,
-            err_fetcher(),
-        )
-        .await;
+        let result =
+            resolve_google_sa_token_with(&cache, TEST_SA_JSON, secret_id, err_fetcher()).await;
 
         // Returns None on failure
         assert!(result.is_none());
 
         // Nothing cached
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         assert!(cache.get_raw(&cache_key).await.is_none());
     }
@@ -767,14 +749,12 @@ mod tests {
     async fn resolve_google_sa_token_nearly_expired_not_cached() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
-        let encrypted_value = "enc1";
 
         // Token expires in 5 minutes — less than the 10-minute margin
         let result = resolve_google_sa_token_with(
             &cache,
             TEST_SA_JSON,
             secret_id,
-            encrypted_value,
             ok_fetcher("ya29.short-lived", 300),
         )
         .await;
@@ -783,7 +763,7 @@ mod tests {
         assert_eq!(result.as_deref(), Some("ya29.short-lived"));
 
         // But NOT cached (lifetime too short)
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         assert!(cache.get_raw(&cache_key).await.is_none());
     }
@@ -792,10 +772,9 @@ mod tests {
     async fn resolve_google_sa_token_expired_entry_triggers_exchange() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
-        let encrypted_value = "enc1";
 
         // Insert an already-expired cache entry (TTL=0)
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         cache.set_raw(&cache_key, "ya29.stale", 0).await;
 
@@ -804,7 +783,6 @@ mod tests {
             &cache,
             TEST_SA_JSON,
             secret_id,
-            encrypted_value,
             ok_fetcher("ya29.refreshed", 3600),
         )
         .await;
@@ -816,14 +794,12 @@ mod tests {
     async fn resolve_google_sa_token_already_expired_fetch_result() {
         let cache = crate::cache::InMemoryCacheStore::new();
         let secret_id = "s1";
-        let encrypted_value = "enc1";
 
         // Exchange returns a token whose expires_at is already in the past
         let result = resolve_google_sa_token_with(
             &cache,
             TEST_SA_JSON,
             secret_id,
-            encrypted_value,
             ok_fetcher("ya29.already-expired", -60), // expired 60s ago
         )
         .await;
@@ -831,7 +807,7 @@ mod tests {
         // Must NOT return or cache the expired token
         assert!(result.is_none(), "expired token must not be returned");
 
-        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let value_hash = &sha256_hex(TEST_SA_JSON)[..16];
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         assert!(
             cache.get_raw(&cache_key).await.is_none(),
@@ -842,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_google_sa_token_invalid_json() {
         let cache = crate::cache::InMemoryCacheStore::new();
-        let result = resolve_google_sa_token_with(&cache, "not-json", "s1", "enc", |_pk, _ce| {
+        let result = resolve_google_sa_token_with(&cache, "not-json", "s1", |_pk, _ce| {
             Box::pin(async { panic!("should not reach fetcher") })
         })
         .await;
@@ -855,7 +831,7 @@ mod tests {
         // Missing private_key
         let sa_json =
             r#"{"type":"service_account","client_email":"test@test.iam.gserviceaccount.com"}"#;
-        let result = resolve_google_sa_token_with(&cache, sa_json, "s1", "enc", |_pk, _ce| {
+        let result = resolve_google_sa_token_with(&cache, sa_json, "s1", |_pk, _ce| {
             Box::pin(async { panic!("should not reach fetcher") })
         })
         .await;
@@ -864,12 +840,16 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_google_sa_token_cache_key_changes_on_rotation() {
-        // Verify that different encrypted_value produces a different cache key
-        let hash1 = &sha256_hex("encrypted_v1")[..16];
-        let hash2 = &sha256_hex("encrypted_v2")[..16];
+        // Verify that different decrypted JSON produces a different cache key,
+        // ensuring key rotation invalidates the cache for both inline and
+        // 1Password-sourced secrets.
+        let json_v1 = r#"{"type":"service_account","private_key":"pk_v1","client_email":"a@test.iam.gserviceaccount.com"}"#;
+        let json_v2 = r#"{"type":"service_account","private_key":"pk_v2","client_email":"a@test.iam.gserviceaccount.com"}"#;
+        let hash1 = &sha256_hex(json_v1)[..16];
+        let hash2 = &sha256_hex(json_v2)[..16];
         assert_ne!(
             hash1, hash2,
-            "different encrypted values must produce different cache keys"
+            "different decrypted JSON must produce different cache keys"
         );
     }
 
