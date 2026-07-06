@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createSecretSchema,
+  GOOGLE_SA_DEFAULT_HOST,
   hostPatternSchema,
   injectionConfigSchema,
   isPathInjection,
@@ -274,6 +275,12 @@ describe("google_service_account schema validation", () => {
         }),
       ).success,
     ).toBe(true);
+  });
+});
+
+describe("GOOGLE_SA_DEFAULT_HOST", () => {
+  it("is www.googleapis.com", () => {
+    expect(GOOGLE_SA_DEFAULT_HOST).toBe("www.googleapis.com");
   });
 });
 

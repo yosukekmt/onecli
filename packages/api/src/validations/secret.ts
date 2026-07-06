@@ -415,6 +415,8 @@ export const detectOpenaiAuthMode = (value: string): OpenaiAuthMode =>
 
 // ── Google Service Account ──
 
+export const GOOGLE_SA_DEFAULT_HOST = "www.googleapis.com";
+
 export interface GoogleServiceAccountJson {
   type: string;
   private_key: string;
