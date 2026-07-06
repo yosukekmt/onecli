@@ -8,6 +8,8 @@ import {
   isPathRegexInjection,
   isPathSafeValue,
   isPathTemplateInjection,
+  parseGoogleServiceAccountJson,
+  parseGoogleServiceAccountMetadata,
   wildcardCoversPublicSuffix,
 } from "./secret";
 
@@ -159,5 +161,149 @@ describe("isPathSafeValue", () => {
     expect(isPathSafeValue("a" + String.fromCharCode(0x09) + "b")).toBe(false);
     expect(isPathSafeValue("a" + String.fromCharCode(0x07) + "b")).toBe(false);
     expect(isPathSafeValue("a" + String.fromCharCode(0x7f) + "b")).toBe(false);
+  });
+});
+
+// ── Google Service Account ──
+
+const validSaJson = JSON.stringify({
+  type: "service_account",
+  project_id: "my-project",
+  private_key:
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n",
+  client_email: "test@my-project.iam.gserviceaccount.com",
+  client_id: "123456789",
+});
+
+const saSecretInput = (overrides: Record<string, unknown> = {}) => ({
+  name: "Google SA",
+  type: "google_service_account" as const,
+  hostPattern: "www.googleapis.com",
+  value: validSaJson,
+  ...overrides,
+});
+
+describe("google_service_account schema validation", () => {
+  it("accepts a valid SA JSON key", () => {
+    expect(createSecretSchema.safeParse(saSecretInput()).success).toBe(true);
+  });
+
+  it("rejects non-JSON value", () => {
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: "not-json" }))
+        .success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON with wrong type field", () => {
+    const wrongType = JSON.stringify({
+      ...JSON.parse(validSaJson),
+      type: "authorized_user",
+    });
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: wrongType })).success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON missing private_key", () => {
+    const parsed = JSON.parse(validSaJson) as Record<string, unknown>;
+    delete parsed.private_key;
+    expect(
+      createSecretSchema.safeParse(
+        saSecretInput({ value: JSON.stringify(parsed) }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON missing client_email", () => {
+    const parsed = JSON.parse(validSaJson) as Record<string, unknown>;
+    delete parsed.client_email;
+    expect(
+      createSecretSchema.safeParse(
+        saSecretInput({ value: JSON.stringify(parsed) }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON with empty private_key", () => {
+    const empty = JSON.stringify({
+      ...JSON.parse(validSaJson),
+      private_key: "",
+    });
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: empty })).success,
+    ).toBe(false);
+  });
+
+  it("rejects SA JSON with empty client_email", () => {
+    const empty = JSON.stringify({
+      ...JSON.parse(validSaJson),
+      client_email: "",
+    });
+    expect(
+      createSecretSchema.safeParse(saSecretInput({ value: empty })).success,
+    ).toBe(false);
+  });
+
+  it("skips SA JSON validation for 1Password source", () => {
+    expect(
+      createSecretSchema.safeParse(
+        saSecretInput({
+          valueSource: "onepassword",
+          opRef: "op://vault/item/field",
+        }),
+      ).success,
+    ).toBe(true);
+  });
+});
+
+describe("parseGoogleServiceAccountJson", () => {
+  it("parses valid SA JSON", () => {
+    const result = parseGoogleServiceAccountJson(validSaJson);
+    expect(result).not.toBeNull();
+    expect(result!.client_email).toBe(
+      "test@my-project.iam.gserviceaccount.com",
+    );
+    expect(result!.project_id).toBe("my-project");
+  });
+
+  it("returns null for non-JSON", () => {
+    expect(parseGoogleServiceAccountJson("not-json")).toBeNull();
+  });
+
+  it("returns null when type is not service_account", () => {
+    expect(
+      parseGoogleServiceAccountJson(
+        JSON.stringify({ ...JSON.parse(validSaJson), type: "authorized_user" }),
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null when private_key is missing", () => {
+    const parsed = JSON.parse(validSaJson) as Record<string, unknown>;
+    delete parsed.private_key;
+    expect(parseGoogleServiceAccountJson(JSON.stringify(parsed))).toBeNull();
+  });
+});
+
+describe("parseGoogleServiceAccountMetadata", () => {
+  it("parses valid metadata", () => {
+    const result = parseGoogleServiceAccountMetadata({
+      clientEmail: "test@example.iam.gserviceaccount.com",
+      projectId: "my-project",
+    });
+    expect(result).not.toBeNull();
+    expect(result!.clientEmail).toBe("test@example.iam.gserviceaccount.com");
+    expect(result!.projectId).toBe("my-project");
+  });
+
+  it("returns null for missing clientEmail", () => {
+    expect(
+      parseGoogleServiceAccountMetadata({ projectId: "my-project" }),
+    ).toBeNull();
+  });
+
+  it("returns null for null", () => {
+    expect(parseGoogleServiceAccountMetadata(null)).toBeNull();
   });
 });

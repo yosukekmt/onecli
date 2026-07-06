@@ -201,7 +201,7 @@ const opDisplaySchema = z
 export const createSecretSchema = z
   .object({
     name: z.string().trim().min(1).max(255),
-    type: z.enum(["anthropic", "openai", "generic"]),
+    type: z.enum(["anthropic", "openai", "generic", "google_service_account"]),
     valueSource: z.enum(valueSources).optional(),
     value: z.string().max(10000).optional(),
     opRef: opRefSchema.optional(),
@@ -225,6 +225,21 @@ export const createSecretSchema = z
         path: ["value"],
         message: "Secret value is required",
       });
+    }
+
+    if (
+      data.type === "google_service_account" &&
+      data.valueSource !== "onepassword" &&
+      data.value
+    ) {
+      if (!parseGoogleServiceAccountJson(data.value)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["value"],
+          message:
+            'Value must be a valid Google Service Account JSON key with type "service_account", private_key, and client_email',
+        });
+      }
     }
   });
 
@@ -397,3 +412,51 @@ export const parseOpenaiMetadata = (
 
 export const detectOpenaiAuthMode = (value: string): OpenaiAuthMode =>
   parseOpenaiOAuthJson(value) !== null ? "oauth" : "api-key";
+
+// ── Google Service Account ──
+
+export interface GoogleServiceAccountJson {
+  type: string;
+  private_key: string;
+  client_email: string;
+  project_id?: string;
+}
+
+export const parseGoogleServiceAccountJson = (
+  value: string,
+): GoogleServiceAccountJson | null => {
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (
+      parsed.type === "service_account" &&
+      typeof parsed.private_key === "string" &&
+      parsed.private_key.length > 0 &&
+      typeof parsed.client_email === "string" &&
+      parsed.client_email.length > 0
+    ) {
+      return parsed as unknown as GoogleServiceAccountJson;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+export interface GoogleServiceAccountMetadata {
+  projectId?: string;
+  clientEmail: string;
+}
+
+export const parseGoogleServiceAccountMetadata = (
+  metadata: unknown,
+): GoogleServiceAccountMetadata | null => {
+  if (
+    metadata &&
+    typeof metadata === "object" &&
+    "clientEmail" in metadata &&
+    typeof (metadata as Record<string, unknown>).clientEmail === "string"
+  ) {
+    return metadata as GoogleServiceAccountMetadata;
+  }
+  return null;
+};
