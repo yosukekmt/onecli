@@ -224,10 +224,14 @@ pub(crate) async fn refresh_openai_oauth_if_expired(
     }
 }
 
-/// TTL for cached Google SA access tokens (50 minutes).
-/// Google tokens expire after 3600s; caching for 3000s leaves a 10-minute
-/// buffer for the token to still be valid when used.
-const SA_TOKEN_CACHE_TTL_SECS: u64 = 3000;
+/// Maximum TTL for cached Google SA access tokens (50 minutes).
+/// The actual TTL is derived from the token's `expires_at`, capped at this
+/// value with a 10-minute safety margin subtracted.
+const SA_TOKEN_MAX_CACHE_TTL_SECS: u64 = 3000;
+
+/// Safety margin subtracted from the token lifetime before caching.
+/// Ensures the cached token is still valid when eventually used.
+const SA_TOKEN_CACHE_MARGIN_SECS: u64 = 600;
 
 /// Resolve a Google Service Account secret into an access token.
 ///
@@ -244,6 +248,27 @@ pub(crate) async fn resolve_google_sa_token(
     secret_id: &str,
     encrypted_value: &str,
 ) -> Option<String> {
+    resolve_google_sa_token_with(
+        cache,
+        decrypted_json,
+        secret_id,
+        encrypted_value,
+        |pk, ce| Box::pin(apps::refresh_google_sa_secret_token(pk, ce)),
+    )
+    .await
+}
+
+/// Inner implementation that accepts a token-fetcher for testability.
+async fn resolve_google_sa_token_with<F>(
+    cache: &dyn CacheStore,
+    decrypted_json: &str,
+    secret_id: &str,
+    encrypted_value: &str,
+    fetch_token: F,
+) -> Option<String>
+where
+    F: for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>,
+{
     let sa: serde_json::Value = serde_json::from_str(decrypted_json)
         .map_err(|e| {
             warn!(secret_id, error = %e, "google_service_account: failed to parse SA JSON");
@@ -273,11 +298,23 @@ pub(crate) async fn resolve_google_sa_token(
 
     debug!(secret_id, "google_service_account: cache miss, exchanging JWT");
 
-    match apps::refresh_google_sa_secret_token(private_key, client_email).await {
-        Ok((access_token, _expires_at)) => {
-            cache
-                .set_raw(&cache_key, &access_token, SA_TOKEN_CACHE_TTL_SECS)
-                .await;
+    match fetch_token(private_key, client_email).await {
+        Ok((access_token, expires_at)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_secs() as i64;
+            let remaining = (expires_at - now) as u64;
+
+            if remaining <= SA_TOKEN_CACHE_MARGIN_SECS {
+                // Token is already (nearly) expired — return it for this
+                // request but don't cache a stale value.
+                warn!(secret_id, remaining, "google_service_account: token lifetime too short to cache");
+                return Some(access_token);
+            }
+
+            let ttl = (remaining - SA_TOKEN_CACHE_MARGIN_SECS).min(SA_TOKEN_MAX_CACHE_TTL_SECS);
+            cache.set_raw(&cache_key, &access_token, ttl).await;
             Some(access_token)
         }
         Err(e) => {
@@ -590,6 +627,33 @@ mod tests {
 
     // ── resolve_google_sa_token: cache behavior ────────────────────────
 
+    /// Valid SA JSON used across resolve tests.
+    const TEST_SA_JSON: &str = r#"{"type":"service_account","private_key":"pk","client_email":"test@test.iam.gserviceaccount.com"}"#;
+
+    /// Helper: returns a fetcher that succeeds with the given token and
+    /// an expires_at of now + `lifetime_secs`.
+    fn ok_fetcher(
+        token: &str,
+        lifetime_secs: i64,
+    ) -> impl for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>
+    {
+        let token = token.to_string();
+        move |_pk, _ce| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs() as i64;
+            Box::pin(async move { Ok((token, now + lifetime_secs)) })
+        }
+    }
+
+    /// Helper: returns a fetcher that always fails.
+    fn err_fetcher(
+    ) -> impl for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>
+    {
+        |_pk, _ce| Box::pin(async { Err(anyhow::anyhow!("exchange failed")) })
+    }
+
     #[tokio::test]
     async fn resolve_google_sa_token_cache_hit() {
         let cache = crate::cache::InMemoryCacheStore::new();
@@ -601,16 +665,127 @@ mod tests {
         let cache_key = format!("sa_token:{secret_id}:{value_hash}");
         cache.set_raw(&cache_key, "ya29.cached-token", 3000).await;
 
-        let sa_json = r#"{"type":"service_account","private_key":"pk","client_email":"test@test.iam.gserviceaccount.com"}"#;
-
-        let result = resolve_google_sa_token(&cache, sa_json, secret_id, encrypted_value).await;
+        // The fetcher should NOT be called (cache hit).
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            |_pk, _ce| Box::pin(async { panic!("fetcher should not be called on cache hit") }),
+        )
+        .await;
         assert_eq!(result.as_deref(), Some("ya29.cached-token"));
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_cache_miss_exchanges_and_caches() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "s1";
+        let encrypted_value = "enc1";
+
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            ok_fetcher("ya29.fresh-token", 3600),
+        )
+        .await;
+
+        // Token returned
+        assert_eq!(result.as_deref(), Some("ya29.fresh-token"));
+
+        // Token was cached
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        let cached = cache.get_raw(&cache_key).await;
+        assert_eq!(cached.as_deref(), Some("ya29.fresh-token"));
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_exchange_failure_not_cached() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "s1";
+        let encrypted_value = "enc1";
+
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            err_fetcher(),
+        )
+        .await;
+
+        // Returns None on failure
+        assert!(result.is_none());
+
+        // Nothing cached
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        assert!(cache.get_raw(&cache_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_nearly_expired_not_cached() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "s1";
+        let encrypted_value = "enc1";
+
+        // Token expires in 5 minutes — less than the 10-minute margin
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            ok_fetcher("ya29.short-lived", 300),
+        )
+        .await;
+
+        // Token still returned for this request
+        assert_eq!(result.as_deref(), Some("ya29.short-lived"));
+
+        // But NOT cached (lifetime too short)
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        assert!(cache.get_raw(&cache_key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_expired_entry_triggers_exchange() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "s1";
+        let encrypted_value = "enc1";
+
+        // Insert an already-expired cache entry (TTL=0)
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        cache.set_raw(&cache_key, "ya29.stale", 0).await;
+
+        // Should trigger a fresh exchange (cache miss due to expiry)
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            ok_fetcher("ya29.refreshed", 3600),
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Some("ya29.refreshed"));
     }
 
     #[tokio::test]
     async fn resolve_google_sa_token_invalid_json() {
         let cache = crate::cache::InMemoryCacheStore::new();
-        let result = resolve_google_sa_token(&cache, "not-json", "s1", "enc").await;
+        let result = resolve_google_sa_token_with(
+            &cache,
+            "not-json",
+            "s1",
+            "enc",
+            |_pk, _ce| Box::pin(async { panic!("should not reach fetcher") }),
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -618,8 +793,16 @@ mod tests {
     async fn resolve_google_sa_token_missing_fields() {
         let cache = crate::cache::InMemoryCacheStore::new();
         // Missing private_key
-        let sa_json = r#"{"type":"service_account","client_email":"test@test.iam.gserviceaccount.com"}"#;
-        let result = resolve_google_sa_token(&cache, sa_json, "s1", "enc").await;
+        let sa_json =
+            r#"{"type":"service_account","client_email":"test@test.iam.gserviceaccount.com"}"#;
+        let result = resolve_google_sa_token_with(
+            &cache,
+            sa_json,
+            "s1",
+            "enc",
+            |_pk, _ce| Box::pin(async { panic!("should not reach fetcher") }),
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -628,7 +811,10 @@ mod tests {
         // Verify that different encrypted_value produces a different cache key
         let hash1 = &sha256_hex("encrypted_v1")[..16];
         let hash2 = &sha256_hex("encrypted_v2")[..16];
-        assert_ne!(hash1, hash2, "different encrypted values must produce different cache keys");
+        assert_ne!(
+            hash1, hash2,
+            "different encrypted values must produce different cache keys"
+        );
     }
 
     // ── sha256_hex ─────────────────────────────────────────────────────
