@@ -276,14 +276,14 @@ describe("updateSecret — google_service_account", () => {
     expect(data.hostPattern).toBe("storage.googleapis.com");
   });
 
-  it("defaults hostPattern to www.googleapis.com when switching to 1Password", async () => {
+  it("preserves existing hostPattern when switching to 1Password", async () => {
     await updateSecret(projectScope, "sec-1", {
       valueSource: "onepassword",
       opRef: "op://vault/item/field",
     });
 
     const data = callData(mockUpdate);
-    expect(data.hostPattern).toBe("www.googleapis.com");
+    expect(data.hostPattern).toBeUndefined();
     expect(data.valueSource).toBe("onepassword");
     expect(data.encryptedValue).toBeNull();
   });

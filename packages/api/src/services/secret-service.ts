@@ -349,8 +349,8 @@ export const updateSecret = async (
     data.opRef = input.opRef;
     if (secret.type === "anthropic") data.hostPattern = "api.anthropic.com";
     if (secret.type === "openai") data.hostPattern = "api.openai.com";
-    if (secret.type === "google_service_account")
-      data.hostPattern = "www.googleapis.com";
+    // SA: preserve existing hostPattern — users may have set a custom host
+    // (e.g. storage.googleapis.com). anthropic/openai have fixed hosts.
     data.metadata = buildOnePasswordMetadata(secret.type, input.opDisplay);
   } else if (input.value !== undefined) {
     let value = input.value.trim();

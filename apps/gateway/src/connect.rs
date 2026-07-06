@@ -338,12 +338,10 @@ impl PolicyEngine {
                 }
             } else if is_google_sa {
                 // Resolve SA JSON → access token via JWT exchange + cache.
-                let encrypted = secret.encrypted_value.as_deref().unwrap_or("");
                 match secret_inject::resolve_google_sa_token(
                     self.cache.as_ref(),
                     &value,
                     &secret.id,
-                    encrypted,
                 )
                 .await
                 {
