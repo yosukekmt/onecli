@@ -267,7 +267,12 @@ async fn resolve_google_sa_token_with<F>(
     fetch_token: F,
 ) -> Option<String>
 where
-    F: for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>,
+    F: for<'a> FnOnce(
+        &'a str,
+        &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>,
+    >,
 {
     let sa: serde_json::Value = serde_json::from_str(decrypted_json)
         .map_err(|e| {
@@ -281,7 +286,10 @@ where
     let (private_key, client_email) = match (private_key, client_email) {
         (Some(pk), Some(ce)) => (pk, ce),
         _ => {
-            warn!(secret_id, "google_service_account: missing private_key or client_email");
+            warn!(
+                secret_id,
+                "google_service_account: missing private_key or client_email"
+            );
             return None;
         }
     };
@@ -296,7 +304,10 @@ where
         return Some(token);
     }
 
-    debug!(secret_id, "google_service_account: cache miss, exchanging JWT");
+    debug!(
+        secret_id,
+        "google_service_account: cache miss, exchanging JWT"
+    );
 
     match fetch_token(private_key, client_email).await {
         Ok((access_token, expires_at)) => {
@@ -309,7 +320,10 @@ where
             if remaining <= 0 {
                 // Token is already expired (clock skew or bad response).
                 // Do not return or cache it.
-                warn!(secret_id, remaining, "google_service_account: received already-expired token");
+                warn!(
+                    secret_id,
+                    remaining, "google_service_account: received already-expired token"
+                );
                 return None;
             }
 
@@ -318,7 +332,10 @@ where
             if remaining_u <= SA_TOKEN_CACHE_MARGIN_SECS {
                 // Token expires soon — return it for this request but
                 // don't cache a value that will be stale shortly.
-                warn!(secret_id, remaining, "google_service_account: token lifetime too short to cache");
+                warn!(
+                    secret_id,
+                    remaining, "google_service_account: token lifetime too short to cache"
+                );
                 return Some(access_token);
             }
 
@@ -608,8 +625,12 @@ mod tests {
 
     #[test]
     fn build_injections_google_sa_bearer_token() {
-        let injections =
-            build_injections("google_service_account", "ya29.test-access-token", None, None);
+        let injections = build_injections(
+            "google_service_account",
+            "ya29.test-access-token",
+            None,
+            None,
+        );
         assert_eq!(injections.len(), 1);
         assert_eq!(
             injections[0],
@@ -644,8 +665,12 @@ mod tests {
     fn ok_fetcher(
         token: &str,
         lifetime_secs: i64,
-    ) -> impl for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>
-    {
+    ) -> impl for<'a> FnOnce(
+        &'a str,
+        &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>,
+    > {
         let token = token.to_string();
         move |_pk, _ce| {
             let now = std::time::SystemTime::now()
@@ -657,9 +682,12 @@ mod tests {
     }
 
     /// Helper: returns a fetcher that always fails.
-    fn err_fetcher(
-    ) -> impl for<'a> FnOnce(&'a str, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>>
-    {
+    fn err_fetcher() -> impl for<'a> FnOnce(
+        &'a str,
+        &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<(String, i64)>> + Send + 'a>,
+    > {
         |_pk, _ce| Box::pin(async { Err(anyhow::anyhow!("exchange failed")) })
     }
 
@@ -814,13 +842,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_google_sa_token_invalid_json() {
         let cache = crate::cache::InMemoryCacheStore::new();
-        let result = resolve_google_sa_token_with(
-            &cache,
-            "not-json",
-            "s1",
-            "enc",
-            |_pk, _ce| Box::pin(async { panic!("should not reach fetcher") }),
-        )
+        let result = resolve_google_sa_token_with(&cache, "not-json", "s1", "enc", |_pk, _ce| {
+            Box::pin(async { panic!("should not reach fetcher") })
+        })
         .await;
         assert!(result.is_none());
     }
@@ -831,13 +855,9 @@ mod tests {
         // Missing private_key
         let sa_json =
             r#"{"type":"service_account","client_email":"test@test.iam.gserviceaccount.com"}"#;
-        let result = resolve_google_sa_token_with(
-            &cache,
-            sa_json,
-            "s1",
-            "enc",
-            |_pk, _ce| Box::pin(async { panic!("should not reach fetcher") }),
-        )
+        let result = resolve_google_sa_token_with(&cache, sa_json, "s1", "enc", |_pk, _ce| {
+            Box::pin(async { panic!("should not reach fetcher") })
+        })
         .await;
         assert!(result.is_none());
     }
