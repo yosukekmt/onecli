@@ -109,6 +109,19 @@ describe("createSecret — google_service_account", () => {
     expect(data.hostPattern).toBe("storage.googleapis.com");
   });
 
+  it("preserves explicit hostPattern for 1Password source", async () => {
+    await createSecret(projectScope, {
+      name: "Google SA",
+      type: "google_service_account",
+      hostPattern: "storage.googleapis.com",
+      valueSource: "onepassword",
+      opRef: "op://vault/item/field",
+    });
+
+    const data = callData(mockCreate);
+    expect(data.hostPattern).toBe("storage.googleapis.com");
+  });
+
   it("rejects invalid SA JSON", async () => {
     await expect(
       createSecret(projectScope, {

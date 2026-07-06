@@ -230,10 +230,9 @@ export const createSecret = async (
       throw new ServiceError("BAD_REQUEST", "Select a 1Password field");
     }
     // LLM keys from 1Password are treated as plain API keys on their fixed host.
+    // Google SA secrets use the schema-defaulted hostPattern (which callers may override).
     if (input.type === "anthropic") hostPattern = "api.anthropic.com";
     if (input.type === "openai") hostPattern = "api.openai.com";
-    if (input.type === "google_service_account")
-      hostPattern = "www.googleapis.com";
 
     return db.secret.create({
       data: {
