@@ -147,6 +147,81 @@ describe("createSecret — google_service_account", () => {
       }),
     ).rejects.toThrow(/service account JSON/);
   });
+
+  it("stores metadata with clientEmail only when project_id is absent", async () => {
+    const saWithoutProject = JSON.stringify({
+      type: "service_account",
+      private_key:
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n",
+      client_email: "test@no-project.iam.gserviceaccount.com",
+    });
+
+    await createSecret(projectScope, {
+      name: "Google SA",
+      type: "google_service_account",
+      hostPattern: "www.googleapis.com",
+      value: saWithoutProject,
+    });
+
+    const data = callData(mockCreate);
+    expect(data.metadata).toEqual({
+      clientEmail: "test@no-project.iam.gserviceaccount.com",
+    });
+    expect(data.metadata).not.toHaveProperty("projectId");
+  });
+
+  it("rejects SA JSON missing private_key", async () => {
+    const noKey = JSON.stringify({
+      type: "service_account",
+      client_email: "test@my-project.iam.gserviceaccount.com",
+      project_id: "my-project",
+    });
+    await expect(
+      createSecret(projectScope, {
+        name: "Google SA",
+        type: "google_service_account",
+        hostPattern: "www.googleapis.com",
+        value: noKey,
+      }),
+    ).rejects.toThrow(/service account JSON/);
+  });
+
+  it("rejects SA JSON missing client_email", async () => {
+    const noEmail = JSON.stringify({
+      type: "service_account",
+      private_key:
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----\n",
+      project_id: "my-project",
+    });
+    await expect(
+      createSecret(projectScope, {
+        name: "Google SA",
+        type: "google_service_account",
+        hostPattern: "www.googleapis.com",
+        value: noEmail,
+      }),
+    ).rejects.toThrow(/service account JSON/);
+  });
+
+  it("error message does not leak private_key value", async () => {
+    const badSa = JSON.stringify({
+      type: "authorized_user",
+      private_key: "SUPER_SECRET_KEY_VALUE",
+      client_email: "test@example.com",
+    });
+    try {
+      await createSecret(projectScope, {
+        name: "Google SA",
+        type: "google_service_account",
+        hostPattern: "www.googleapis.com",
+        value: badSa,
+      });
+      expect.unreachable("should have thrown");
+    } catch (err: unknown) {
+      const msg = (err as Error).message;
+      expect(msg).not.toContain("SUPER_SECRET_KEY_VALUE");
+    }
+  });
 });
 
 describe("updateSecret — google_service_account", () => {
@@ -199,5 +274,29 @@ describe("updateSecret — google_service_account", () => {
 
     const data = callData(mockUpdate);
     expect(data.hostPattern).toBe("storage.googleapis.com");
+  });
+
+  it("defaults hostPattern to www.googleapis.com when switching to 1Password", async () => {
+    await updateSecret(projectScope, "sec-1", {
+      valueSource: "onepassword",
+      opRef: "op://vault/item/field",
+    });
+
+    const data = callData(mockUpdate);
+    expect(data.hostPattern).toBe("www.googleapis.com");
+    expect(data.valueSource).toBe("onepassword");
+    expect(data.encryptedValue).toBeNull();
+  });
+
+  it("metadata from value update excludes private_key", async () => {
+    await updateSecret(projectScope, "sec-1", {
+      value: validSaJson,
+      valueSource: "inline",
+    });
+
+    const data = callData(mockUpdate);
+    expect(data.metadata).not.toHaveProperty("private_key");
+    expect(data.metadata).not.toHaveProperty("privateKey");
+    expect(data.metadata).toHaveProperty("clientEmail");
   });
 });
