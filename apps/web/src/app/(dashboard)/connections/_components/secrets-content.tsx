@@ -198,7 +198,9 @@ export const SecretsContent = ({
         prefill={prefill}
         defaultType={typeFilter === "generic" ? "generic" : undefined}
         allowedTypes={
-          typeFilter === "llm" ? ["anthropic", "openai"] : undefined
+          typeFilter === "llm"
+            ? ["anthropic", "openai", "google_service_account"]
+            : undefined
         }
         secretActions={secretActions}
       />
