@@ -276,6 +276,40 @@ describe("google_service_account schema validation", () => {
       ).success,
     ).toBe(true);
   });
+
+  it("defaults hostPattern to GOOGLE_SA_DEFAULT_HOST when omitted", () => {
+    const input = saSecretInput();
+    delete (input as Record<string, unknown>).hostPattern;
+    const result = createSecretSchema.safeParse(input);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.hostPattern).toBe("www.googleapis.com");
+    }
+  });
+
+  it("preserves explicit hostPattern override", () => {
+    const result = createSecretSchema.safeParse(
+      saSecretInput({ hostPattern: "storage.googleapis.com" }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.hostPattern).toBe("storage.googleapis.com");
+    }
+  });
+
+  it("rejects omitted hostPattern for non-SA types", () => {
+    expect(
+      createSecretSchema.safeParse({
+        name: "Generic Secret",
+        type: "generic",
+        value: "my-token",
+        injectionConfig: {
+          headerName: "Authorization",
+          valueFormat: "Bearer {value}",
+        },
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("GOOGLE_SA_DEFAULT_HOST", () => {

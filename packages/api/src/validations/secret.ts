@@ -206,11 +206,21 @@ export const createSecretSchema = z
     value: z.string().max(10000).optional(),
     opRef: opRefSchema.optional(),
     opDisplay: opDisplaySchema,
-    hostPattern: hostPatternSchema,
+    hostPattern: hostPatternSchema.optional(),
     pathPattern: z.string().max(1000).optional(),
     injectionConfig: injectionConfigSchema,
   })
   .superRefine((data, ctx) => {
+    // hostPattern is required for all types except google_service_account,
+    // which defaults to GOOGLE_SA_DEFAULT_HOST when omitted.
+    if (!data.hostPattern && data.type !== "google_service_account") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["hostPattern"],
+        message: "Host pattern is required",
+      });
+    }
+
     if (data.valueSource === "onepassword") {
       if (!data.opRef) {
         ctx.addIssue({
@@ -241,7 +251,11 @@ export const createSecretSchema = z
         });
       }
     }
-  });
+  })
+  .transform((data) => ({
+    ...data,
+    hostPattern: data.hostPattern ?? GOOGLE_SA_DEFAULT_HOST,
+  }));
 
 export type CreateSecretInput = z.infer<typeof createSecretSchema>;
 
