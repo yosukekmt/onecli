@@ -421,6 +421,10 @@ export const SecretDialog = ({
     const option = SECRET_TYPE_OPTIONS.find((o) => o.value === selected);
     setHostPattern(option?.hostDefault ?? "");
     setName(option?.nameDefault ?? "");
+    if (selected === "google_service_account") {
+      setOpSelection(null);
+      setValue("");
+    }
     setStep("form");
   };
 
@@ -438,8 +442,7 @@ export const SecretDialog = ({
         ? paramName.trim().length > 0
         : hasPathTarget);
 
-  const saValueValid =
-    !isGoogleSA || fromOnePassword || !value.trim() || !!parsedSA;
+  const saValueValid = !isGoogleSA || !value.trim() || !!parsedSA;
 
   const pathPreview = useMemo(
     () =>
@@ -455,7 +458,7 @@ export const SecretDialog = ({
       hasInjectionTarget &&
       saValueValid
     : isNameValid &&
-      (fromOnePassword || !!value.trim()) &&
+      ((!isGoogleSA && fromOnePassword) || !!value.trim()) &&
       hostPattern.trim() &&
       !hostPatternError &&
       hasInjectionTarget &&
