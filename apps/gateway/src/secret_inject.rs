@@ -304,16 +304,25 @@ where
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
                 .as_secs() as i64;
-            let remaining = (expires_at - now) as u64;
+            let remaining = expires_at - now; // signed: can be negative
 
-            if remaining <= SA_TOKEN_CACHE_MARGIN_SECS {
-                // Token is already (nearly) expired — return it for this
-                // request but don't cache a stale value.
+            if remaining <= 0 {
+                // Token is already expired (clock skew or bad response).
+                // Do not return or cache it.
+                warn!(secret_id, remaining, "google_service_account: received already-expired token");
+                return None;
+            }
+
+            let remaining_u = remaining as u64;
+
+            if remaining_u <= SA_TOKEN_CACHE_MARGIN_SECS {
+                // Token expires soon — return it for this request but
+                // don't cache a value that will be stale shortly.
                 warn!(secret_id, remaining, "google_service_account: token lifetime too short to cache");
                 return Some(access_token);
             }
 
-            let ttl = (remaining - SA_TOKEN_CACHE_MARGIN_SECS).min(SA_TOKEN_MAX_CACHE_TTL_SECS);
+            let ttl = (remaining_u - SA_TOKEN_CACHE_MARGIN_SECS).min(SA_TOKEN_MAX_CACHE_TTL_SECS);
             cache.set_raw(&cache_key, &access_token, ttl).await;
             Some(access_token)
         }
@@ -773,6 +782,33 @@ mod tests {
         .await;
 
         assert_eq!(result.as_deref(), Some("ya29.refreshed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_already_expired_fetch_result() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "s1";
+        let encrypted_value = "enc1";
+
+        // Exchange returns a token whose expires_at is already in the past
+        let result = resolve_google_sa_token_with(
+            &cache,
+            TEST_SA_JSON,
+            secret_id,
+            encrypted_value,
+            ok_fetcher("ya29.already-expired", -60), // expired 60s ago
+        )
+        .await;
+
+        // Must NOT return or cache the expired token
+        assert!(result.is_none(), "expired token must not be returned");
+
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        assert!(
+            cache.get_raw(&cache_key).await.is_none(),
+            "expired token must not be cached"
+        );
     }
 
     #[tokio::test]
