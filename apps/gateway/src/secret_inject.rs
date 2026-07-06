@@ -1,12 +1,15 @@
-//! Secret-to-injection mapping and OpenAI OAuth token refresh.
+//! Secret-to-injection mapping, OpenAI OAuth token refresh, and Google
+//! Service Account token resolution.
 //!
 //! Converts decrypted secret values into injection instructions based on the
-//! secret type (anthropic, openai, generic). OpenAI supports both API keys
-//! (plain string) and OAuth credentials (JSON with tokens). Also handles
-//! OpenAI OAuth token refresh and credential persistence.
+//! secret type (anthropic, openai, google_service_account, generic). Also
+//! handles OpenAI OAuth token refresh, Google SA JWT→access_token exchange
+//! with in-memory caching, and credential persistence.
 
 use tracing::{debug, warn};
 
+use crate::apps;
+use crate::cache::CacheStore;
 use crate::crypto::CryptoService;
 use crate::db;
 use crate::inject::Injection;
@@ -84,6 +87,19 @@ pub(crate) fn build_injections(
                     value: format!("Bearer {decrypted_value}"),
                 }]
             }
+        }
+
+        // The effective value is already the resolved access token (not the
+        // SA JSON key) — token resolution happens in resolve_secret_injections().
+        "google_service_account" => {
+            if decrypted_value.is_empty() {
+                warn!("google_service_account secret: empty access token");
+                return vec![];
+            }
+            vec![Injection::SetHeader {
+                name: "authorization".to_string(),
+                value: format!("Bearer {decrypted_value}"),
+            }]
         }
 
         "generic" => {
@@ -206,6 +222,82 @@ pub(crate) async fn refresh_openai_oauth_if_expired(
             None
         }
     }
+}
+
+/// TTL for cached Google SA access tokens (50 minutes).
+/// Google tokens expire after 3600s; caching for 3000s leaves a 10-minute
+/// buffer for the token to still be valid when used.
+const SA_TOKEN_CACHE_TTL_SECS: u64 = 3000;
+
+/// Resolve a Google Service Account secret into an access token.
+///
+/// Parses the decrypted SA JSON key, checks the in-memory cache for a valid
+/// token, and exchanges a new JWT→access_token if needed. The cache key
+/// includes a hash of `encrypted_value` so that key rotation immediately
+/// invalidates the cached token.
+///
+/// Returns `Some(access_token)` on success, or `None` (after logging) on
+/// failure so the caller can skip the secret.
+pub(crate) async fn resolve_google_sa_token(
+    cache: &dyn CacheStore,
+    decrypted_json: &str,
+    secret_id: &str,
+    encrypted_value: &str,
+) -> Option<String> {
+    let sa: serde_json::Value = serde_json::from_str(decrypted_json)
+        .map_err(|e| {
+            warn!(secret_id, error = %e, "google_service_account: failed to parse SA JSON");
+        })
+        .ok()?;
+
+    let private_key = sa.get("private_key").and_then(|v| v.as_str());
+    let client_email = sa.get("client_email").and_then(|v| v.as_str());
+
+    let (private_key, client_email) = match (private_key, client_email) {
+        (Some(pk), Some(ce)) => (pk, ce),
+        _ => {
+            warn!(secret_id, "google_service_account: missing private_key or client_email");
+            return None;
+        }
+    };
+
+    // Cache key includes a short hash of the encrypted value so that key
+    // rotation (which changes encrypted_value) invalidates the cache entry.
+    let value_hash = &sha256_hex(encrypted_value)[..16];
+    let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+
+    if let Some(token) = cache.get_raw(&cache_key).await {
+        debug!(secret_id, "google_service_account: cache hit");
+        return Some(token);
+    }
+
+    debug!(secret_id, "google_service_account: cache miss, exchanging JWT");
+
+    match apps::refresh_google_sa_secret_token(private_key, client_email).await {
+        Ok((access_token, _expires_at)) => {
+            cache
+                .set_raw(&cache_key, &access_token, SA_TOKEN_CACHE_TTL_SECS)
+                .await;
+            Some(access_token)
+        }
+        Err(e) => {
+            warn!(secret_id, error = ?e, "google_service_account: token exchange failed");
+            None
+        }
+    }
+}
+
+/// Compute a hex-encoded SHA-256 digest (used for cache key versioning).
+fn sha256_hex(input: &str) -> String {
+    use ring::digest;
+    let hash = digest::digest(&digest::SHA256, input.as_bytes());
+    hash.as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Refresh an OpenAI OAuth access_token using the refresh_token.
@@ -466,11 +558,91 @@ mod tests {
         assert!(injections.is_empty());
     }
 
+    // ── build_injections: google_service_account ─────────────────────
+
+    #[test]
+    fn build_injections_google_sa_bearer_token() {
+        let injections =
+            build_injections("google_service_account", "ya29.test-access-token", None, None);
+        assert_eq!(injections.len(), 1);
+        assert_eq!(
+            injections[0],
+            Injection::SetHeader {
+                name: "authorization".to_string(),
+                value: "Bearer ya29.test-access-token".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_injections_google_sa_empty_token() {
+        let injections = build_injections("google_service_account", "", None, None);
+        assert!(injections.is_empty());
+    }
+
     // ── build_injections: unknown ──────────────────────────────────────
 
     #[test]
     fn build_injections_unknown_type() {
         let injections = build_injections("unknown", "value", None, None);
         assert!(injections.is_empty());
+    }
+
+    // ── resolve_google_sa_token: cache behavior ────────────────────────
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_cache_hit() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let secret_id = "secret_123";
+        let encrypted_value = "encrypted_blob";
+
+        // Pre-populate cache
+        let value_hash = &sha256_hex(encrypted_value)[..16];
+        let cache_key = format!("sa_token:{secret_id}:{value_hash}");
+        cache.set_raw(&cache_key, "ya29.cached-token", 3000).await;
+
+        let sa_json = r#"{"type":"service_account","private_key":"pk","client_email":"test@test.iam.gserviceaccount.com"}"#;
+
+        let result = resolve_google_sa_token(&cache, sa_json, secret_id, encrypted_value).await;
+        assert_eq!(result.as_deref(), Some("ya29.cached-token"));
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_invalid_json() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        let result = resolve_google_sa_token(&cache, "not-json", "s1", "enc").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_missing_fields() {
+        let cache = crate::cache::InMemoryCacheStore::new();
+        // Missing private_key
+        let sa_json = r#"{"type":"service_account","client_email":"test@test.iam.gserviceaccount.com"}"#;
+        let result = resolve_google_sa_token(&cache, sa_json, "s1", "enc").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_google_sa_token_cache_key_changes_on_rotation() {
+        // Verify that different encrypted_value produces a different cache key
+        let hash1 = &sha256_hex("encrypted_v1")[..16];
+        let hash2 = &sha256_hex("encrypted_v2")[..16];
+        assert_ne!(hash1, hash2, "different encrypted values must produce different cache keys");
+    }
+
+    // ── sha256_hex ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sha256_hex_deterministic() {
+        let h1 = sha256_hex("hello");
+        let h2 = sha256_hex("hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn sha256_hex_different_inputs() {
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
     }
 }
